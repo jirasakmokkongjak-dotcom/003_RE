@@ -1,7 +1,3 @@
-"""Neo4j Movie Recommendation System — Streamlit UI
-
-Run:  streamlit run app.py
-"""
 import os
 
 import pandas as pd
@@ -11,7 +7,7 @@ from neo4j import GraphDatabase
 st.set_page_config(page_title="Neo4j Movie Recommender", page_icon="🎬", layout="wide")
 
 # ----------------------------------------------------------------------------
-# Sample data (ตรงกับ README: 10 users, 10 movies) — แก้ไขได้ตามใน notebook
+# Sample data: เพิ่ม Genres และความสัมพันธ์ของหนังกับ Genre
 # ----------------------------------------------------------------------------
 USERS = [
     ("U001", "Alex"), ("U002", "Nicha"), ("U003", "Ben"), ("U004", "Waris"),
@@ -24,6 +20,17 @@ MOVIES = [
     ("M006", "Doctor Strange"), ("M007", "Captain America: Civil War"),
     ("M008", "Spider-Man: Homecoming"), ("M009", "Avengers: Endgame"),
     ("M010", "Ant-Man"),
+]
+GENRES = [
+    ("G01", "Action"), ("G02", "Sci-Fi"), ("G03", "Adventure"), ("G04", "Fantasy")
+]
+# กำหนดว่าหนังเรื่องไหนอยู่แนวไหนบ้าง
+MOVIE_GENRES = [
+    ("M001", "G01"), ("M001", "G02"),
+    ("M002", "G01"), ("M002", "G03"), ("M003", "G01"), ("M003", "G03"),
+    ("M004", "G01"), ("M004", "G04"), ("M005", "G02"), ("M005", "G03"),
+    ("M006", "G04"), ("M007", "G01"), ("M007", "G03"), ("M008", "G01"),
+    ("M009", "G01"), ("M009", "G03"), ("M010", "G01"), ("M010", "G02"),
 ]
 FRIENDSHIPS = [
     ("U001", "U002"), ("U001", "U003"), ("U001", "U004"),
@@ -47,7 +54,6 @@ WATCHES = [
 # Connection
 # ----------------------------------------------------------------------------
 def default_config() -> dict:
-    """อ่านค่าจาก .streamlit/secrets.toml ก่อน แล้วค่อย environment variables"""
     try:
         s = dict(st.secrets["neo4j"])
     except Exception:
@@ -58,41 +64,38 @@ def default_config() -> dict:
         "password": s.get("password") or os.getenv("NEO4J_PASSWORD", ""),
     }
 
-
 @st.cache_resource(show_spinner="กำลังเชื่อมต่อ Neo4j...")
 def get_driver(uri: str, user: str, password: str):
     driver = GraphDatabase.driver(uri, auth=(user, password))
     driver.verify_connectivity()
     return driver
 
-
 def run(query: str, **params) -> pd.DataFrame:
-    """รัน Cypher แบบ parameterized แล้วคืนเป็น DataFrame (เหมือนใน notebook)"""
     records, _, _ = st.session_state.driver.execute_query(
         query, parameters_=params, database_=st.session_state.database
     )
     return pd.DataFrame([r.data() for r in records])
-
 
 def write(query: str, **params) -> None:
     st.session_state.driver.execute_query(
         query, parameters_=params, database_=st.session_state.database
     )
 
-
 # ----------------------------------------------------------------------------
-# Cypher
+# Cypher (ปรับเปลี่ยนระบบแนะนำเป็น Genre-based)
 # ----------------------------------------------------------------------------
 Q_USERS = "MATCH (u:User) RETURN u.user_id AS id, u.name AS name ORDER BY id"
 
+# แนะนำหนังตามแนว (Genre) ที่ผู้ใช้เคยดูบ่อย แต่ยังไม่เคยรับชมเรื่องนั้นๆ
 Q_RECOMMEND = """
-MATCH (me:User {user_id: $user_id})-[:FRIEND_OF]-(friend:User)-[:WATCHED]->(movie:Movie)
-WHERE NOT EXISTS { MATCH (me)-[:WATCHED]->(movie) }
-RETURN movie.movie_id AS movie_id,
-       movie.title AS recommendation,
-       count(DISTINCT friend) AS friend_score,
-       collect(DISTINCT friend.name) AS friends
-ORDER BY friend_score DESC, recommendation
+MATCH (me:User {user_id: $user_id})-[:WATCHED]->(:Movie)-[:IN_GENRE]->(g:Genre)
+<-[:IN_GENRE]-(rec:Movie)
+WHERE NOT EXISTS { MATCH (me)-[:WATCHED]->(rec) }
+RETURN rec.movie_id AS movie_id,
+       rec.title AS recommendation,
+       count(DISTINCT g) AS genre_score,
+       collect(DISTINCT g.name) AS shared_genres
+ORDER BY genre_score DESC, recommendation
 """
 
 Q_WATCHED = """
@@ -104,11 +107,6 @@ ORDER BY watch_date
 Q_FRIENDS = """
 MATCH (:User {user_id: $user_id})-[:FRIEND_OF]-(f:User)
 RETURN DISTINCT f.user_id AS friend_id, f.name AS friend ORDER BY friend_id
-"""
-
-Q_FRIEND_MOVIES = """
-MATCH (me:User {user_id: $user_id})-[:FRIEND_OF]-(f:User)-[:WATCHED]->(m:Movie)
-RETURN f.name AS friend, m.title AS movie ORDER BY friend, movie
 """
 
 Q_MOVIES_PER_USER = """
@@ -124,15 +122,17 @@ RETURN m.title AS movie, count(*) AS watch_count ORDER BY watch_count DESC, movi
 Q_COUNTS = """
 CALL { MATCH (u:User) RETURN count(u) AS users }
 CALL { MATCH (m:Movie) RETURN count(m) AS movies }
+CALL { MATCH (g:Genre) RETURN count(g) AS genres }
 CALL { MATCH ()-[r:FRIEND_OF]->() RETURN count(r) AS friendships }
 CALL { MATCH ()-[r:WATCHED]->() RETURN count(r) AS watches }
-RETURN users, movies, friendships, watches
+RETURN users, movies, genres, friendships, watches
 """
-
 
 def seed_database() -> None:
     write("CREATE CONSTRAINT user_id_unique IF NOT EXISTS FOR (u:User) REQUIRE u.user_id IS UNIQUE")
     write("CREATE CONSTRAINT movie_id_unique IF NOT EXISTS FOR (m:Movie) REQUIRE m.movie_id IS UNIQUE")
+    write("CREATE CONSTRAINT genre_id_unique IF NOT EXISTS FOR (g:Genre) REQUIRE g.genre_id IS UNIQUE")
+    
     write(
         "UNWIND $rows AS row MERGE (u:User {user_id: row.user_id}) SET u.name = row.name",
         rows=[{"user_id": i, "name": n} for i, n in USERS],
@@ -140,6 +140,16 @@ def seed_database() -> None:
     write(
         "UNWIND $rows AS row MERGE (m:Movie {movie_id: row.movie_id}) SET m.title = row.title",
         rows=[{"movie_id": i, "title": t} for i, t in MOVIES],
+    )
+    write(
+        "UNWIND $rows AS row MERGE (g:Genre {genre_id: row.genre_id}) SET g.name = row.name",
+        rows=[{"genre_id": i, "name": n} for i, n in GENRES],
+    )
+    write(
+        """UNWIND $rows AS row
+           MATCH (m:Movie {movie_id: row.movie_id}), (g:Genre {genre_id: row.genre_id})
+           MERGE (m)-[:IN_GENRE]->(g)""",
+        rows=[{"movie_id": m, "genre_id": g} for m, g in MOVIE_GENRES],
     )
     write(
         """UNWIND $rows AS row
@@ -154,7 +164,6 @@ def seed_database() -> None:
            SET r.watch_date = date(row.date)""",
         rows=[{"user_id": u, "movie_id": m, "date": d} for u, m, d in WATCHES],
     )
-
 
 # ----------------------------------------------------------------------------
 # Sidebar: connect
@@ -176,8 +185,8 @@ if connect or (cfg["uri"] and cfg["password"] and "driver" not in st.session_sta
     except Exception as e:
         st.sidebar.error(f"เชื่อมต่อไม่สำเร็จ: {e}")
 
-st.title("🎬 Neo4j Movie Recommendation")
-st.caption("แนะนำหนังจากสิ่งที่เพื่อนเคยดู ด้วย Graph Traversal บน Neo4j Aura")
+st.title("🎬 Neo4j Genre-based Movie Recommendation")
+st.caption("แนะนำหนังตามแนวภาพยนตร์ (Genre) ที่ผู้ใช้ชื่นชอบ ด้วย Graph Traversal บน Neo4j")
 
 if "driver" not in st.session_state:
     st.info("กรอกข้อมูลเชื่อมต่อที่แถบด้านซ้าย แล้วกด **Connect**")
@@ -195,8 +204,8 @@ users_df = run(Q_USERS)
 # Setup
 # ----------------------------------------------------------------------------
 with tab_setup:
-    st.subheader("สร้างข้อมูลตัวอย่าง")
-    st.write("สร้าง Constraint, User 10 คน, Movie 10 เรื่อง, FRIEND_OF และ WATCHED (ใช้ `MERGE` จึงกดซ้ำได้ไม่เกิดข้อมูลซ้ำ)")
+    st.subheader("สร้างข้อมูลตัวอย่าง (รวม Genres)")
+    st.write("สร้าง Constraint, User, Movie, Genre, ความสัมพันธ์ IN_GENRE, FRIEND_OF และ WATCHED")
     if st.button("Seed sample data"):
         with st.spinner("กำลังสร้างข้อมูล..."):
             seed_database()
@@ -205,11 +214,12 @@ with tab_setup:
     counts = run(Q_COUNTS)
     if not counts.empty:
         c = counts.iloc[0]
-        cols = st.columns(4)
+        cols = st.columns(5)
         cols[0].metric("Users", int(c["users"]))
         cols[1].metric("Movies", int(c["movies"]))
-        cols[2].metric("FRIEND_OF", int(c["friendships"]))
-        cols[3].metric("WATCHED", int(c["watches"]))
+        cols[2].metric("Genres", int(c["genres"]))
+        cols[3].metric("FRIEND_OF", int(c["friendships"]))
+        cols[4].metric("WATCHED", int(c["watches"]))
 
 if users_df.empty:
     for t in (tab_rec, tab_user, tab_stats, tab_graph):
@@ -225,34 +235,34 @@ with st.sidebar:
 user_name = users_df.set_index("id").loc[user_id, "name"]
 
 # ----------------------------------------------------------------------------
-# Recommend
+# Recommend (Genre-based)
 # ----------------------------------------------------------------------------
 with tab_rec:
-    st.subheader(f"หนังที่แนะนำให้ {user_name}")
+    st.subheader(f"หนังที่แนะนำให้ {user_name} (อ้างอิงจากแนวหนังที่ชอบ)")
     rec = run(Q_RECOMMEND, user_id=user_id)
     if rec.empty:
-        st.info("ไม่มีหนังแนะนำ — เพื่อนยังไม่ได้ดูหนังที่ผู้ใช้นี้ยังไม่เคยดู หรือยังไม่มีเพื่อน")
+        st.info("ไม่มีหนังแนะนำ — ผู้ใช้อาจดูหนังครบทุกเรื่องแล้ว หรือยังไม่ได้ดูหนังเลย")
     else:
         left, right = st.columns([3, 2])
         with left:
             st.dataframe(
-                rec.assign(friends=rec["friends"].map(", ".join)),
+                rec.assign(shared_genres=rec["shared_genres"].map(", ".join)),
                 hide_index=True,
                 use_container_width=True,
                 column_config={
                     "movie_id": "Movie ID",
                     "recommendation": "หนัง",
-                    "friend_score": st.column_config.ProgressColumn(
-                        "friend_score", min_value=0, max_value=int(rec["friend_score"].max()), format="%d"
+                    "genre_score": st.column_config.ProgressColumn(
+                        "genre_score", min_value=0, max_value=int(rec["genre_score"].max()), format="%d"
                     ),
-                    "friends": "เพื่อนที่เคยดู",
+                    "shared_genres": "แนวหนังที่ตรงกัน",
                 },
             )
         with right:
-            st.bar_chart(rec.set_index("recommendation")["friend_score"])
+            st.bar_chart(rec.set_index("recommendation")["genre_score"])
     with st.expander("Cypher ที่ใช้"):
         st.code(Q_RECOMMEND, language="cypher")
-    st.caption("friend_score = จำนวนเพื่อนที่เคยดูหนังเรื่องนั้น (กฎแบบง่าย ไม่ใช่โมเดล ML)")
+    st.caption("genre_score = จำนวนแนวหนัง (Genres) ที่ซ้อนทับกับประวัติการดูของผู้ใช้")
 
 # ----------------------------------------------------------------------------
 # User
@@ -266,8 +276,6 @@ with tab_user:
     with c2:
         st.markdown("**เพื่อน**")
         st.dataframe(run(Q_FRIENDS, user_id=user_id), hide_index=True, use_container_width=True)
-    st.markdown("**เพื่อนดูหนังอะไรบ้าง (Alex → Friend → Movie)**")
-    st.dataframe(run(Q_FRIEND_MOVIES, user_id=user_id), hide_index=True, use_container_width=True)
 
 # ----------------------------------------------------------------------------
 # Analytics
@@ -286,33 +294,36 @@ with tab_stats:
             st.bar_chart(df.set_index("movie")["watch_count"])
 
 # ----------------------------------------------------------------------------
-# Graph (Graphviz ในตัว Streamlit ไม่ต้องติดตั้งเพิ่ม)
+# Graph
 # ----------------------------------------------------------------------------
 def esc(s: str) -> str:
     return str(s).replace('"', '\\"')
 
-
 with tab_graph:
-    st.subheader(f"Ego graph ของ {user_name}")
-    friends = run(Q_FRIENDS, user_id=user_id)
+    st.subheader(f"Ego graph ของ {user_name} (User -> Movie -> Genre)")
     mine = run(Q_WATCHED, user_id=user_id)
-    fm = run(Q_FRIEND_MOVIES, user_id=user_id)
-    rec_titles = set(run(Q_RECOMMEND, user_id=user_id).get("recommendation", []))
+    rec_df = run(Q_RECOMMEND, user_id=user_id)
+    rec_titles = set(rec_df.get("recommendation", []))
     mine_titles = set(mine.get("title", []))
+
+    # ดึงข้อมูล Genre ของหนังที่ผู้ใช้ดู
+    Q_USER_GENRES = """
+    MATCH (u:User {user_id: $user_id})-[:WATCHED]->(m:Movie)-[:IN_GENRE]->(g:Genre)
+    RETURN DISTINCT m.title AS movie, g.name AS genre
+    """
+    ug_df = run(Q_USER_GENRES, user_id=user_id)
 
     dot = ["digraph G { rankdir=LR; node [style=filled, fontname=Helvetica];"]
     dot.append(f'"me" [label="{esc(user_name)}", shape=circle, fillcolor="#4F8BF9", fontcolor=white];')
-    for f in friends.get("friend", []):
-        dot.append(f'"f_{esc(f)}" [label="{esc(f)}", shape=circle, fillcolor="#BFD7FF"];')
-        dot.append(f'"me" -> "f_{esc(f)}" [label="FRIEND_OF", fontsize=9];')
-    movie_nodes = mine_titles | set(fm.get("movie", []))
-    for m in movie_nodes:
-        color = "#FFD166" if m in rec_titles else ("#B7E4C7" if m in mine_titles else "#EEEEEE")
-        dot.append(f'"m_{esc(m)}" [label="{esc(m)}", shape=box, fillcolor="{color}"];')
+    
     for m in mine_titles:
+        dot.append(f'"m_{esc(m)}" [label="{esc(m)}", shape=box, fillcolor="#B7E4C7"];')
         dot.append(f'"me" -> "m_{esc(m)}" [label="WATCHED", fontsize=9, color="#2D6A4F"];')
-    for _, row in fm.iterrows():
-        dot.append(f'"f_{esc(row.friend)}" -> "m_{esc(row.movie)}" [label="WATCHED", fontsize=9];')
+
+    for _, row in ug_df.iterrows():
+        dot.append(f'"g_{esc(row.genre)}" [label="{esc(row.genre)}", shape=ellipse, fillcolor="#FFD166"];')
+        dot.append(f'"m_{esc(row.movie)}" -> "g_{esc(row.genre)}" [label="IN_GENRE", fontsize=9];')
+
     dot.append("}")
     st.graphviz_chart("\n".join(dot), use_container_width=True)
-    st.caption("🟩 เคยดูแล้ว · 🟨 หนังที่แนะนำ · ⬜ เพื่อนดู แต่ผู้ใช้ยังไม่ดู")
+    st.caption("🟩 หนังที่เคยดู · 🟨 แนวหนัง (Genre)")
