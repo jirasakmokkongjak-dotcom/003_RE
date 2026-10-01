@@ -118,11 +118,11 @@ if users_df.empty:
     st.warning("ไม่พบข้อมูลผู้ใช้งาน (User) ในฐานข้อมูล")
     st.stop()
 
-# Sidebar ตัวเลือก User[cite: 3]
+# Sidebar ตัวเลือก User
 labels = {r.id: f"{r.id} · {r['name']}" for _, r in users_df.iterrows()}
 with st.sidebar:
-    st.header("👤 ตัวเลือก")[cite: 3]
-    user_id = st.selectbox("เลือกผู้ใช้งาน", list(labels), format_func=labels.get)[cite: 3]
+    st.header("👤 ตัวเลือก")
+    user_id = st.selectbox("เลือกผู้ใช้งาน", list(labels), format_func=labels.get)
 
 user_name = users_df.set_index("id").loc[user_id, "name"]
 
