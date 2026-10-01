@@ -6,7 +6,7 @@ from neo4j import GraphDatabase
 st.set_page_config(page_title="Neo4j Multi-Strategy Movie Recommender", page_icon="🎬", layout="wide")
 
 # ----------------------------------------------------------------------------
-# Connection (ดึงค่าจาก secrets หรือ environment variable โดยตรง)
+# Connection
 # ----------------------------------------------------------------------------
 def get_config() -> dict:
     try:
@@ -47,6 +47,7 @@ def run(query: str, **params) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 Q_USERS = "MATCH (u:User) RETURN u.user_id AS id, u.name AS name ORDER BY id"
 
+# 1. แนะนำตามเพื่อนในเครือข่าย (Friend-based Movie Rec)
 Q_REC_FRIEND = """
 MATCH (me:User {user_id: $user_id})-[:FRIEND_OF]-(friend:User)-[:WATCHED]->(movie:Movie)
 WHERE NOT EXISTS { MATCH (me)-[:WATCHED]->(movie) }
@@ -57,6 +58,7 @@ RETURN movie.movie_id AS movie_id,
 ORDER BY score DESC, recommendation
 """
 
+# 2. แนะนำตามแนวหนังที่ชอบ (Genre-based Movie Rec)
 Q_REC_GENRE = """
 MATCH (me:User {user_id: $user_id})-[:WATCHED]->(:Movie)-[:IN_GENRE]->(g:Genre)
 <-[:IN_GENRE]-(rec:Movie)
@@ -68,6 +70,7 @@ RETURN rec.movie_id AS movie_id,
 ORDER BY score DESC, recommendation
 """
 
+# 3. แนะนำจากผู้ที่มีรสนิยมคล้ายกัน (Collaborative Filtering Movie Rec)
 Q_REC_SIMILAR_USERS = """
 MATCH (me:User {user_id: $user_id})-[:WATCHED]->(m:Movie)<-[:WATCHED]-(other:User)
 WHERE other <> me
@@ -78,6 +81,18 @@ RETURN rec.movie_id AS movie_id,
        count(DISTINCT other) AS score,
        collect(DISTINCT other.name) AS details
 ORDER BY score DESC, recommendation
+"""
+
+# 4. แนะนำเพื่อน (Friend Recommendation: Mutual Friends / Friends of Friends)
+Q_REC_FRIEND_SUGGESTION = """
+MATCH (me:User {user_id: $user_id})-[:FRIEND_OF]-(mutual:User)-[:FRIEND_OF]-(suggested:User)
+WHERE me <> suggested
+  AND NOT (me)-[:FRIEND_OF]-(suggested)
+RETURN suggested.user_id AS user_id,
+       suggested.name AS friend_name,
+       count(DISTINCT mutual) AS mutual_count,
+       collect(DISTINCT mutual.name) AS mutual_friends
+ORDER BY mutual_count DESC, friend_name
 """
 
 Q_WATCHED = """
@@ -95,7 +110,7 @@ RETURN DISTINCT f.user_id AS friend_id, f.name AS friend ORDER BY friend_id
 # UI
 # ----------------------------------------------------------------------------
 st.title("🎬 Neo4j Multi-Strategy Movie Recommender")
-st.caption("ระบบแนะนำหนังหลายรูปแบบด้วย Graph Traversal บน Neo4j")
+st.caption("ระบบแนะนำหนังและเพื่อนด้วย Graph Traversal บน Neo4j")
 
 users_df = run(Q_USERS)
 
@@ -103,20 +118,20 @@ if users_df.empty:
     st.warning("ไม่พบข้อมูลผู้ใช้งาน (User) ในฐานข้อมูล")
     st.stop()
 
-# Sidebar เหลือเฉพาะตัวเลือก User
+# Sidebar ตัวเลือก User[cite: 3]
 labels = {r.id: f"{r.id} · {r['name']}" for _, r in users_df.iterrows()}
 with st.sidebar:
-    st.header("👤 ตัวเลือก")
-    user_id = st.selectbox("เลือกผู้ใช้งาน", list(labels), format_func=labels.get)
+    st.header("👤 ตัวเลือก")[cite: 3]
+    user_id = st.selectbox("เลือกผู้ใช้งาน", list(labels), format_func=labels.get)[cite: 3]
 
 user_name = users_df.set_index("id").loc[user_id, "name"]
 
-tab_rec, tab_user, tab_stats = st.tabs(
-    ["🎯 ระบบแนะนำหนัง", "👤 ข้อมูลผู้ใช้", "📊 สถิติภาพรวม"]
+tab_rec, tab_friend_rec, tab_user, tab_stats = st.tabs(
+    ["🎯 ระบบแนะนำหนัง", "👥 แนะนำเพื่อน", "👤 ข้อมูลผู้ใช้", "📊 สถิติภาพรวม"]
 )
 
 # ----------------------------------------------------------------------------
-# Recommend Tab
+# Recommend Tab (ระบบแนะนำหนัง)
 # ----------------------------------------------------------------------------
 with tab_rec:
     st.subheader(f"🎯 ระบบแนะนำหนังสำหรับ: {user_name}")
@@ -172,6 +187,39 @@ with tab_rec:
             
     with st.expander("ดูชุดคำสั่ง Cypher Query ที่ใช้ประมวลผล"):
         st.code(cypher_used, language="cypher")
+
+# ----------------------------------------------------------------------------
+# Friend Recommendation Tab (แท็บแนะนำเพื่อน)
+# ----------------------------------------------------------------------------
+with tab_friend_rec:
+    st.subheader(f"👥 ระบบแนะนำเพื่อนสำหรับ: {user_name}")
+    st.caption("คำนวณจากคนที่มีเพื่อนร่วมกัน (Mutual Friends / Friends of Friends)")
+    
+    rec_friends = run(Q_REC_FRIEND_SUGGESTION, user_id=user_id)
+    
+    if rec_friends.empty:
+        st.info("ไม่พบคำแนะนำเพื่อนสำหรับผู้ใช้นี้ (อาจจะเป็นเพื่อนกับทุกคนในระบบแล้ว หรือไม่มีเพื่อนร่วมกัน)")
+    else:
+        f_left, f_right = st.columns([3, 2])
+        with f_left:
+            st.dataframe(
+                rec_friends.assign(mutual_friends=rec_friends["mutual_friends"].map(", ".join)),
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "user_id": "User ID",
+                    "friend_name": "ชื่อผู้ใช้ที่แนะนำ",
+                    "mutual_count": st.column_config.ProgressColumn(
+                        "จำนวนเพื่อนร่วมกัน", min_value=0, max_value=int(rec_friends["mutual_count"].max()), format="%d"
+                    ),
+                    "mutual_friends": "เพื่อนร่วมกัน",
+                },
+            )
+        with f_right:
+            st.bar_chart(rec_friends.set_index("friend_name")["mutual_count"])
+
+    with st.expander("ดูชุดคำสั่ง Cypher Query ที่ใช้ประมวลผล"):
+        st.code(Q_REC_FRIEND_SUGGESTION, language="cypher")
 
 # ----------------------------------------------------------------------------
 # User Tab
